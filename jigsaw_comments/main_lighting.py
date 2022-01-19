@@ -1,4 +1,5 @@
 # https://www.kaggle.com/atamazian/nlp-getting-started-electra-pytorch-lightning/notebook
+from datetime import datetime
 import os
 
 from tqdm import tqdm
@@ -10,6 +11,7 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler, Sequentia
 import torch.nn as nn
 import torch
 
+from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import LightningDataModule
 from pytorch_lightning import Trainer
@@ -18,20 +20,25 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 # import our library
 import torchmetrics
 
-from transformers import BertModel, AdamW, BertTokenizerFast, AutoTokenizer, BertTokenizer
+from transformers import AdamW, BertTokenizerFast, AutoTokenizer, BertTokenizer, \
+    get_linear_schedule_with_warmup, BertForTokenClassification, BertModel
 
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 
-from main import prepare_datasets
+from prepare_data import prepare_datasets, clean_data
 
 BATCH_SIZE = 64
-EPOCHS = 10
+EPOCHS = 50
 MAX_LEN = 128
-REMOTE = True
+REMOTE = False
+TRAIN, VALIDATE = True, False
+FOLDS = 1
+DEVICE = 'cuda:7' if REMOTE else 'cpu'
+DEBUG = True
 
 
 class LightningJigsawModel(LightningModule):
-    def __init__(self, model_name, num_classes):
+    def __init__(self, model_name, num_classes, total_steps):
         super(LightningJigsawModel, self).__init__()
         self.model = BertModel.from_pretrained(model_name)
         self.drop = nn.Dropout(p=0.2)
@@ -42,6 +49,8 @@ class LightningJigsawModel(LightningModule):
         self.loss_function = nn.MSELoss()
         # Metrics
         self.metric = torchmetrics.MeanSquaredError()
+        # Warm up
+        self.warmup_steps = 0
 
     def forward(self, ids, mask):
         out = self.model(input_ids=ids, attention_mask=mask, return_dict=False)
@@ -55,6 +64,8 @@ class LightningJigsawModel(LightningModule):
         b_labels = batch[2]
         z = self(b_input_ids, b_input_mask)
         loss = self.loss_function(z, b_labels)
+        self.log('train_loss', loss, prog_bar=True)
+        self.log('train_mse_score', self.metric(z.reshape(-1), b_labels), prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -68,35 +79,24 @@ class LightningJigsawModel(LightningModule):
         return val_loss
 
     def configure_optimizers(self):
-        return AdamW(self.parameters(), lr=0.01, eps=1e-8)
+        optimizer = AdamW(self.parameters(), lr=0.01, eps=1e-8)
 
-    # Todo add test step if desired
-    # def test_step(self, batch, batch_idx):
-    #     x, y = batch.text[0].T, batch.label
-    #     y_hat = self(x)
-    #     loss = self.loss_function(y_hat, y)
-    #     return dict(
-    #         test_loss=loss,
-    #         log=dict(
-    #             test_loss=loss
-    #         )
-    #     )
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=len(self.trainer.datamodule.train_inputs) * self.trainer.max_epochs,
+        )
 
-    # def test_epoch_end(self, outputs):
-    #     avg_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
-    #     tensorboard_logs = dict(
-    #         test_loss=avg_loss
-    #     )
-    #     return dict(
-    #         avg_test_loss=avg_loss,
-    #         log=tensorboard_logs
-    #     )
+        scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
+
+        return [optimizer], [scheduler]
 
 
 class LitDataNLP(LightningDataModule):
-    def __init__(self, fold, data_path, batch_size, tokenizer, max_length):
+    def __init__(self, fold, data_path, batch_size, tokenizer, max_length, debugging):
         super().__init__()
         self.fold = fold
+        self.debugging = debugging
         self.batch_size = batch_size
         self.max_len = max_length
         self.tokenizer = tokenizer
@@ -107,6 +107,34 @@ class LitDataNLP(LightningDataModule):
         self.validation_labels = None
         self.train_masks = None
         self.validation_masks = None
+
+    def prepare_train_valid(self, folds, inputs, labels):
+
+        ids = np.array(inputs['input_ids'])
+        mask = np.array(inputs['attention_mask'])
+
+        if folds <= 1:
+            train_inputs, validation_inputs, train_masks, validation_masks, train_labels, validation_labels = \
+                train_test_split(ids, mask, labels, test_size=0.2)
+        else:
+            kf = KFold(FOLDS, shuffle=True, random_state=42)
+
+            # Check it out. The code implements kf cross validation in this way ?¿
+            for fold, (tr_idx, val_idx) in enumerate(kf.split(ids, labels)):
+                train_inputs = ids[tr_idx]
+                train_labels = labels[tr_idx]
+                validation_inputs = ids[val_idx]
+                validation_labels = labels[val_idx]
+                if fold == self.fold:
+                    break
+
+            for fold, (tr_idx, val_idx) in enumerate(kf.split(mask, labels)):
+                train_masks = mask[tr_idx]
+                validation_masks = mask[val_idx]
+                if fold == self.fold:
+                    break
+
+        return train_inputs, validation_inputs, train_masks, validation_masks, train_labels, validation_labels
 
     def setup(self, stage=None):
         # assumes data in format text and labels
@@ -120,6 +148,12 @@ class LitDataNLP(LightningDataModule):
         # Combine 3 datasets
         train_data = pd.concat([toxic_data, ruddit_data, toxic_multiling_data], ignore_index=True)
 
+        if self.debugging:
+            train_data = train_data.sample(n=1000, random_state=1)
+
+        # Further data cleaning.
+        train_data = clean_data(train_data, 'text')
+
         text, labels = train_data.text.values.tolist(), train_data.y.values
 
         inputs = self.tokenizer.batch_encode_plus(
@@ -130,25 +164,8 @@ class LitDataNLP(LightningDataModule):
             padding='max_length'
         )
 
-        kf = KFold(5, shuffle=True, random_state=42)
-
-        ids = np.array(inputs['input_ids'])
-        mask = np.array(inputs['attention_mask'])
-
-        # Check it out. The code implements kf cross validation in this way ?¿
-        for fold, (tr_idx, val_idx) in enumerate(kf.split(ids, labels)):
-            train_inputs = ids[tr_idx]
-            train_labels = labels[tr_idx]
-            validation_inputs = ids[val_idx]
-            validation_labels = labels[val_idx]
-            if fold == self.fold:
-                break
-
-        for fold, (tr_idx, val_idx) in enumerate(kf.split(mask, labels)):
-            train_masks = mask[tr_idx]
-            validation_masks = mask[val_idx]
-            if fold == self.fold:
-                break
+        train_inputs, validation_inputs, train_masks, validation_masks, train_labels, validation_labels = \
+            self.prepare_train_valid(FOLDS, inputs, labels)
 
         self.train_inputs = torch.tensor(train_inputs)
         self.validation_inputs = torch.tensor(validation_inputs)
@@ -191,9 +208,9 @@ def run_inference(data_dir, colname, model, device, model_path, batch_size: int 
     print('Predicting labels...')
 
     preds = []
-    for fold in range(5):
+    for fold in range(FOLDS):
         # Load the best model per fold.
-        model.load_state_dict(torch.load(f'{model_path}/fold_{fold}/model_best.ckpt')['state_dict'])
+        model.load_state_dict(torch.load(f'{model_path}/fold_{fold}/model_best.ckpt', map_location=device)['state_dict'])
         model.eval()
         model.to(device)
 
@@ -208,40 +225,42 @@ def run_inference(data_dir, colname, model, device, model_path, batch_size: int 
             with torch.no_grad():
                 outputs = model(b_input_ids, b_input_mask)
 
-            preds = outputs[0]
+            preds = outputs.reshape(-1)
             preds = preds.detach().cpu().numpy()
 
             # Store predictions and true labels
             predictions.append(preds)
 
         flat_predictions = [item for sublist in predictions for item in sublist]
-        flat_predictions = np.argmax(flat_predictions, axis=1).flatten()
         preds.append(flat_predictions)
     return np.round(np.mean(preds, axis=0), 0)
 
 
 if __name__ == '__main__':
 
-    TRAIN, VALIDATE = False, True
-
     if REMOTE:
         path = '/home/daca/kaggle_challenges/jigsaw_comments/data/'
     else:
         path = 'data/'
 
-    DEVICE = 'cuda:7' if REMOTE else 'cpu'
+    experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     model_name = 'bert-base-uncased'
-    model_path = './output_lightning'
+    model_path = os.path.join('./output_lightning', experiment_id)
+    log_dir = os.path.join("logs", experiment_id)
+
     os.makedirs(model_path, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     if TRAIN:
-        tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=True)
+        tokenizer = BertTokenizerFast.from_pretrained(model_name, do_lower_case=True)
 
-        for fold in range(5):
+        for fold in range(FOLDS):
             model_fold_path = os.path.join(model_path, f'fold_{fold}')
             os.makedirs(model_fold_path, exist_ok=True)
-            dm = LitDataNLP(fold=fold, data_path=path, tokenizer=tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LEN)
+            dm = LitDataNLP(fold=fold, data_path=path, tokenizer=tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LEN,
+                            debugging=DEBUG)
+
             chk_callback = ModelCheckpoint(
                 monitor='val_mse_score',
                 dirpath=model_fold_path,
@@ -256,21 +275,25 @@ if __name__ == '__main__':
                verbose=False,
                mode='min'
             )
-            model = LightningJigsawModel(model_name=model_name, num_classes=1)
+            model = LightningJigsawModel(model_name=model_name, num_classes=1, total_steps=1000)
+
+            tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
 
             if REMOTE:
                 trainer = Trainer(
                     devices=[4, 5],
                     accelerator="gpu",
                     max_epochs=EPOCHS,
-                    callbacks=[chk_callback, es_callback]
+                    callbacks=[chk_callback, es_callback],
+                    logger=tb_logger
                 )
 
             else:
                 trainer = Trainer(
                     accelerator="cpu",
                     max_epochs=EPOCHS,
-                    callbacks=[chk_callback, es_callback]
+                    callbacks=[chk_callback, es_callback],
+                    logger=tb_logger
                 )
 
             trainer.fit(model, dm)

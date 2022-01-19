@@ -19,6 +19,8 @@ from transformers import AutoTokenizer, AutoModel, BertTokenizerFast, BertModel,
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split, KFold
 
+from prepare_data import prepare_datasets
+
 # For descriptive error messages
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 gpu_id = 5
@@ -45,28 +47,6 @@ CONFIG_TRAIN = dict(
 )
 
 CONFIG_TRAIN["tokenizer"] = BertTokenizerFast.from_pretrained(CONFIG_TRAIN['model_name'], do_lower_case=True)
-
-
-def prepare_datasets(ruddit_data, toxic_data, toxic_multil_data):
-    # Give more weight to severe toxic
-    toxic_data['severe_toxic'] = toxic_data.severe_toxic * 2
-    toxic_data['y'] = (toxic_data[['toxic', 'severe_toxic', 'obscene', 'threat',
-                                   'insult', 'identity_hate']].sum(axis=1)).astype(int)
-    toxic_data['y'] = toxic_data['y'] / toxic_data['y'].max()
-    toxic_data = toxic_data[['comment_text', 'y']].rename(columns={'comment_text': 'text'})
-    # Ruddit data
-    ruddit_data = ruddit_data[['txt',
-                               'offensiveness_score']].rename(columns={'txt': 'text', 'offensiveness_score': 'y'})
-    ruddit_data['y'] = (ruddit_data['y'] - ruddit_data.y.min()) / (ruddit_data.y.max() - ruddit_data.y.min())
-    # Toxic multilingual
-    toxic_multil_data['severe_toxic'] = toxic_multil_data.severe_toxic * 2
-    toxic_multil_data['y'] = \
-        (toxic_multil_data[['toxic', 'severe_toxic', 'obscene', 'threat', 'insult',
-                            'identity_hate']].sum(axis=1)).astype(int)
-    toxic_multil_data['y'] = toxic_multil_data['y'] / toxic_multil_data['y'].max()
-    toxic_multil_data = toxic_multil_data[['comment_text', 'y']].rename(columns={'comment_text': 'text'})
-
-    return toxic_data, ruddit_data, toxic_multil_data
 
 
 def set_seed(seed=42):
