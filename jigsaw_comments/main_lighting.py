@@ -30,11 +30,11 @@ from prepare_data import prepare_datasets, clean_data
 BATCH_SIZE = 64
 EPOCHS = 50
 MAX_LEN = 128
-REMOTE = False
+REMOTE = True
 TRAIN, VALIDATE = True, False
 FOLDS = 1
 DEVICE = 'cuda:7' if REMOTE else 'cpu'
-DEBUG = True
+DEBUG = False
 
 
 class LightningJigsawModel(LightningModule):
@@ -281,7 +281,8 @@ if __name__ == '__main__':
 
             if REMOTE:
                 trainer = Trainer(
-                    devices=[4, 5],
+                    # devices=[4, 5], error with scheduler from transformers if using more than one
+                    devices=[4],
                     accelerator="gpu",
                     max_epochs=EPOCHS,
                     callbacks=[chk_callback, es_callback],
