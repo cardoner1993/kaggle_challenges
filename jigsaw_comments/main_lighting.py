@@ -38,7 +38,7 @@ DEBUG = False
 
 
 class LightningJigsawModel(LightningModule):
-    def __init__(self, model_name, num_classes, total_steps):
+    def __init__(self, model_name, num_classes):
         super(LightningJigsawModel, self).__init__()
         self.model = BertModel.from_pretrained(model_name)
         self.drop = nn.Dropout(p=0.2)
