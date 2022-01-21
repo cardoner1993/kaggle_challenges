@@ -275,7 +275,7 @@ if __name__ == '__main__':
                verbose=False,
                mode='min'
             )
-            model = LightningJigsawModel(model_name=model_name, num_classes=1, total_steps=1000)
+            model = LightningJigsawModel(model_name=model_name, num_classes=1)
 
             tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
 
