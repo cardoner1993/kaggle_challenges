@@ -15,17 +15,17 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import LightningDataModule
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 
 # import our library
 import torchmetrics
 
 from transformers import AdamW, BertTokenizerFast, AutoTokenizer, BertTokenizer, \
-    get_linear_schedule_with_warmup, BertForTokenClassification, BertModel
+    get_linear_schedule_with_warmup, BertForSequenceClassification, BertModel
 
 from sklearn.model_selection import KFold, train_test_split
 
-from prepare_data import prepare_datasets, clean_data
+from prepare_data import prepare_datasets, clean_data, text_cleaning, prepare_multiclass_datasets
 
 BATCH_SIZE = 64
 EPOCHS = 50
@@ -35,47 +35,91 @@ TRAIN, VALIDATE = True, False
 FOLDS = 1
 DEVICE = 'cuda:7' if REMOTE else 'cpu'
 DEBUG = False
+model_type = "regression" # classification
+monitor_metric = 'val_f1_score' if model_type == 'classification' else 'val_mse_score'
 
 
 class LightningJigsawModel(LightningModule):
-    def __init__(self, model_name, num_classes):
+    def __init__(self, model_name, num_classes=None, model_type='regression'):
         super(LightningJigsawModel, self).__init__()
-        self.model = BertModel.from_pretrained(model_name)
+        self.model_type = model_type
+        
+        self.model_regr = BertForSequenceClassification.from_pretrained(model_name, num_labels=num_classes, output_attentions=False,
+                                                                           output_hidden_states=False)
         self.drop = nn.Dropout(p=0.2)
         self.fc = nn.Linear(768, num_classes)
         # Optional add Relu final layer not used now in forward
         self.relu = nn.ReLU()
-        # Loss function
-        self.loss_function = nn.MSELoss()
-        # Metrics
-        self.metric = torchmetrics.MeanSquaredError()
-        # Warm up
-        self.warmup_steps = 0
+        
+        self.model_regr._init_weights(self.fc)
 
-    def forward(self, ids, mask):
-        out = self.model(input_ids=ids, attention_mask=mask, return_dict=False)
-        out = self.drop(out[1])
-        outputs = self.fc(out)
-        return outputs.type(torch.float64)
+        self.model_classification = BertForSequenceClassification.from_pretrained(model_name, num_labels=num_classes,
+                                                                           output_attentions=False,
+                                                                           output_hidden_states=False)
+
+        
+        # Warm up wait n epochs
+        self.warmup_steps = 0
+        # Loss function
+        self.loss_function = nn.MSELoss() if self.model_type == 'regression' else None
+        # Metrics
+        self.regr_metric = torchmetrics.MeanSquaredError()
+        # threshold (float) – Threshold for transforming probability or logit predictions to binary (0,1) 
+        self.classif_metric = torchmetrics.F1(num_classes=num_classes)
+
+    def forward(self, ids, mask, b_labels=None):
+        if self.model_type == 'regression':
+            outputs = self.model_regr(input_ids=ids, attention_mask=mask, labels=b_labels)
+            # out = self.drop(out[1])
+            # out = self.fc(out)
+            # outputs = self.relu(out)
+            # return outputs.type(torch.float64)
+            return outputs
+        else:
+            outputs = self.model_classification(input_ids=ids, attention_mask=mask, labels=b_labels)
+            # return outputs.type(torch.float64)
+            return outputs
+
+    def on_train_batch_start(self, batch, batch_idx):
+        # Logs learning
+        self.log('learning_rate', self.trainer.lr_schedulers[0]['scheduler'].get_lr()[0], prog_bar=True, logger=True)
 
     def training_step(self, batch, batch_idx):
         b_input_ids = batch[0]
         b_input_mask = batch[1]
         b_labels = batch[2]
-        z = self(b_input_ids, b_input_mask)
-        loss = self.loss_function(z, b_labels)
+        z = self(b_input_ids, b_input_mask, b_labels)
+
+        if self.model_type == 'regression':
+            # loss = self.loss_function(z, b_labels)
+            loss = z[0]
+            self.log('train_mse_score', loss, prog_bar=True, logger=True)
+            # self.log('train_mse_score', self.metric(z.reshape(-1), b_labels), prog_bar=True, logger=True)      
+        else:
+            loss, logits = z[0], z[1]
+            self.log('train_f1_score', self.classif_metric(logits, b_labels), prog_bar=True)
+
         self.log('train_loss', loss, prog_bar=True)
-        self.log('train_mse_score', self.metric(z.reshape(-1), b_labels), prog_bar=True, logger=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
         b_input_ids = batch[0]
         b_input_mask = batch[1]
         b_labels = batch[2]
-        z = self(b_input_ids, b_input_mask)
-        val_loss = self.loss_function(z, b_labels)
+        z = self(b_input_ids, b_input_mask, b_labels)
+        
+        if self.model_type == 'regression':
+            # val_loss = self.loss_function(z, b_labels)
+            val_loss = z[0]
+            self.log('val_mse_score', val_loss, prog_bar=True, logger=True)
+            # self.log('val_mse_score', self.metric(z.reshape(-1), b_labels), prog_bar=True, logger=True)
+        else:
+            val_loss, logits = z[0], z[1]
+            self.log('val_f1_score', self.classif_metric(logits, b_labels), prog_bar=True)
+
         self.log('val_loss', val_loss, prog_bar=True)
-        self.log('val_mse_score', self.metric(z.reshape(-1), b_labels), prog_bar=True, logger=True)
+
         return val_loss
 
     def configure_optimizers(self):
@@ -84,7 +128,7 @@ class LightningJigsawModel(LightningModule):
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=self.warmup_steps,
-            num_training_steps=len(self.trainer.datamodule.train_inputs) * self.trainer.max_epochs,
+            num_training_steps=len(self.trainer.datamodule.train_dataloader()) * self.trainer.max_epochs,
         )
 
         scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
@@ -93,7 +137,7 @@ class LightningJigsawModel(LightningModule):
 
 
 class LitDataNLP(LightningDataModule):
-    def __init__(self, fold, data_path, batch_size, tokenizer, max_length, debugging):
+    def __init__(self, fold, data_path, batch_size, tokenizer, max_length, debugging, model_type='regression'):
         super().__init__()
         self.fold = fold
         self.debugging = debugging
@@ -107,6 +151,35 @@ class LitDataNLP(LightningDataModule):
         self.validation_labels = None
         self.train_masks = None
         self.validation_masks = None
+        self.num_labels = None
+        self.model_type = model_type
+
+        self.train_data = self.prepare_dataset()
+    
+    def prepare_dataset(self):
+        ruddit_data, toxic_data, toxic_multiling_data = \
+            pd.read_csv(os.path.join(self.data_path, 'ruddit_with_text.csv')), \
+            pd.read_csv(os.path.join(self.data_path, 'train.csv')), \
+            pd.read_csv(os.path.join(self.data_path, 'jigsaw-toxic-comment-train.csv'))
+
+        if self.model_type == 'regression':
+            self.num_labels = 1
+            # Train process
+            toxic_data, ruddit_data, toxic_multiling_data = prepare_datasets(ruddit_data, toxic_data, toxic_multiling_data)
+            # Combine 3 datasets
+            # train_data = pd.concat([toxic_data, ruddit_data, toxic_multiling_data], ignore_index=True)
+            train_data = pd.concat([toxic_data, ruddit_data], ignore_index=True)
+        else:
+            toxic_data, toxic_multiling_data = prepare_multiclass_datasets(toxic_data, toxic_multiling_data)
+            # train_data = pd.concat([toxic_data, toxic_multiling_data], ignore_index=True)
+            train_data = toxic_data
+            self.num_labels = len(train_data['y'].unique())
+        
+        
+        if self.debugging:
+            train_data = train_data.sample(n=1000, random_state=1)
+        
+        return train_data
 
     def prepare_train_valid(self, folds, inputs, labels):
 
@@ -138,23 +211,32 @@ class LitDataNLP(LightningDataModule):
 
     def setup(self, stage=None):
         # assumes data in format text and labels
-        ruddit_data, toxic_data, toxic_multiling_data = \
-            pd.read_csv(os.path.join(self.data_path, 'ruddit_with_text.csv')), \
-            pd.read_csv(os.path.join(self.data_path, 'train.csv')), \
-            pd.read_csv(os.path.join(self.data_path, 'jigsaw-toxic-comment-train.csv'))
+        # ruddit_data, toxic_data, toxic_multiling_data = \
+        #     pd.read_csv(os.path.join(self.data_path, 'ruddit_with_text.csv')), \
+        #     pd.read_csv(os.path.join(self.data_path, 'train.csv')), \
+        #     pd.read_csv(os.path.join(self.data_path, 'jigsaw-toxic-comment-train.csv'))
 
-        # Train process
-        toxic_data, ruddit_data, toxic_multiling_data = prepare_datasets(ruddit_data, toxic_data, toxic_multiling_data)
-        # Combine 3 datasets
-        train_data = pd.concat([toxic_data, ruddit_data, toxic_multiling_data], ignore_index=True)
+        # if self.model_type == 'regression':
+        #     self.num_labels = 1
+        #     # Train process
+        #     toxic_data, ruddit_data, toxic_multiling_data = prepare_datasets(ruddit_data, toxic_data, toxic_multiling_data)
+        #     # Combine 3 datasets
+        #     train_data = pd.concat([toxic_data, ruddit_data, toxic_multiling_data], ignore_index=True)
+        #     # train_data = pd.concat([toxic_data, toxic_multiling_data], ignore_index=True)
+        # else:
+        #     toxic_data, toxic_multiling_data = prepare_multiclass_datasets(toxic_data, toxic_multiling_data)
+        #     train_data = pd.concat([toxic_data, toxic_multiling_data], ignore_index=True)
+        #     self.num_labels = len(train_data['y'].unique())
 
-        if self.debugging:
-            train_data = train_data.sample(n=1000, random_state=1)
+        # if self.debugging:
+        #     train_data = train_data.sample(n=1000, random_state=1)
 
         # Further data cleaning.
-        train_data = clean_data(train_data, 'text')
+        # train_data = clean_data(train_data, 'text')
 
-        text, labels = train_data.text.values.tolist(), train_data.y.values
+        self.train_data['text'] = self.train_data['text'].apply(text_cleaning)
+
+        text, labels = self.train_data.text.values.tolist(), self.train_data.y.values
 
         inputs = self.tokenizer.batch_encode_plus(
             text,
@@ -167,12 +249,20 @@ class LitDataNLP(LightningDataModule):
         train_inputs, validation_inputs, train_masks, validation_masks, train_labels, validation_labels = \
             self.prepare_train_valid(FOLDS, inputs, labels)
 
-        self.train_inputs = torch.tensor(train_inputs)
-        self.validation_inputs = torch.tensor(validation_inputs)
-        self.train_labels = torch.tensor(train_labels, dtype=torch.float64)
-        self.validation_labels = torch.tensor(validation_labels, dtype=torch.float64)
-        self.train_masks = torch.tensor(train_masks, dtype=torch.long)
-        self.validation_masks = torch.tensor(validation_masks, dtype=torch.long)
+        if self.model_type == 'regression':
+            self.train_inputs = torch.tensor(train_inputs)
+            self.validation_inputs = torch.tensor(validation_inputs)
+            self.train_labels = torch.tensor(train_labels, dtype=torch.float)
+            self.validation_labels = torch.tensor(validation_labels, dtype=torch.float)
+            self.train_masks = torch.tensor(train_masks, dtype=torch.long)
+            self.validation_masks = torch.tensor(validation_masks, dtype=torch.long)
+        else:
+            self.train_inputs = torch.tensor(train_inputs)
+            self.validation_inputs = torch.tensor(validation_inputs)
+            self.train_labels = torch.tensor(train_labels, dtype=torch.long)
+            self.validation_labels = torch.tensor(validation_labels, dtype=torch.long)
+            self.train_masks = torch.tensor(train_masks, dtype=torch.long)
+            self.validation_masks = torch.tensor(validation_masks, dtype=torch.long)
 
     def train_dataloader(self):
         train_data = TensorDataset(self.train_inputs, self.train_masks, self.train_labels)
@@ -243,7 +333,7 @@ if __name__ == '__main__':
     else:
         path = 'data/'
 
-    experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_id = f"type_{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     model_name = 'bert-base-uncased'
     model_path = os.path.join('./output_lightning', experiment_id)
@@ -259,23 +349,26 @@ if __name__ == '__main__':
             model_fold_path = os.path.join(model_path, f'fold_{fold}')
             os.makedirs(model_fold_path, exist_ok=True)
             dm = LitDataNLP(fold=fold, data_path=path, tokenizer=tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LEN,
-                            debugging=DEBUG)
-
+                            debugging=DEBUG, model_type=model_type)
+            
+            lr_monitor = LearningRateMonitor(logging_interval='step')
+            
             chk_callback = ModelCheckpoint(
-                monitor='val_mse_score',
+                monitor=monitor_metric,
                 dirpath=model_fold_path,
                 filename='model_best',
                 save_top_k=1,
                 mode='min',
             )
+            
             es_callback = EarlyStopping(
-               monitor='val_mse_score',
+               monitor=monitor_metric,
                min_delta=0.001,
                patience=5,
                verbose=False,
                mode='min'
             )
-            model = LightningJigsawModel(model_name=model_name, num_classes=1)
+            model = LightningJigsawModel(model_name=model_name, num_classes=dm.num_labels, model_type=model_type)
 
             tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
 
@@ -285,7 +378,7 @@ if __name__ == '__main__':
                     devices=[4],
                     accelerator="gpu",
                     max_epochs=EPOCHS,
-                    callbacks=[chk_callback, es_callback],
+                    callbacks=[chk_callback, es_callback, lr_monitor],
                     logger=tb_logger
                 )
 
@@ -293,7 +386,7 @@ if __name__ == '__main__':
                 trainer = Trainer(
                     accelerator="cpu",
                     max_epochs=EPOCHS,
-                    callbacks=[chk_callback, es_callback],
+                    callbacks=[chk_callback, es_callback, lr_monitor],
                     logger=tb_logger
                 )
 
