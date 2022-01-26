@@ -32,11 +32,14 @@ EPOCHS = 50
 MAX_LEN = 128
 REMOTE = True
 TRAIN, VALIDATE = True, False
-FOLDS = 1
+FOLDS = 3
 DEVICE = 'cuda:7' if REMOTE else 'cpu'
 DEBUG = False
-model_type = "regression" # classification
+model_type = "regression" # classification regression
 monitor_metric = 'val_f1_score' if model_type == 'classification' else 'val_mse_score'
+mode = 'max' if model_type == 'classification' else 'min'
+
+print(f"PARAMETERS MODE {mode}, MONITOR METRIC {monitor_metric} MODEL TYPE {model_type}")
 
 
 class LightningJigsawModel(LightningModule):
@@ -358,7 +361,7 @@ if __name__ == '__main__':
                 dirpath=model_fold_path,
                 filename='model_best',
                 save_top_k=1,
-                mode='min',
+                mode=mode,
             )
             
             es_callback = EarlyStopping(
@@ -366,7 +369,7 @@ if __name__ == '__main__':
                min_delta=0.001,
                patience=5,
                verbose=False,
-               mode='min'
+               mode=mode
             )
             model = LightningJigsawModel(model_name=model_name, num_classes=dm.num_labels, model_type=model_type)
 
