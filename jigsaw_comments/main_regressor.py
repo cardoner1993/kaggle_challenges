@@ -1,4 +1,7 @@
 # Build ridge cv with tf-idf
+# Add multiple data sources. Use as test the comment_to_score.csv
+# Run ridge over tfidf vectors and generate p1 and p2 for the validation set csv file 
+# Predict for the comments_to_score for each fold and average. Finally, combine all predictions to generate final score.
 
 import pandas as pd
 import numpy as np
@@ -229,6 +232,15 @@ if __name__ == '__main__':
 
     val_acc = (p1< p2).mean()
     print(f"Ensemble: val_acc:{val_acc:.5f}")
+
+    df_val['p1'] = p1
+    df_val['p2'] = p2
+    df_val['diff'] = np.abs(p2 - p1)
+    df_val['correct'] = (p1 < p2).astype('int')
+    ### Incorrect predictions with similar scores
+    print(df_val[df_val.correct == 0].sort_values('diff', ascending=True).head(30))
+
+    df_val.to_csv(os.path.join(path, "validation_csv_pred_regressor.csv"), index=False)
 
 
     score = jc_preds/jc_max + juc_preds/juc_max + rud_preds/rud_max  

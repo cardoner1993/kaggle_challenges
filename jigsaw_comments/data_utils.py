@@ -15,5 +15,5 @@ def validate_correlation(df, threshold=0.95):
     # Find features with correlation greater than 0.95
     to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
 
-    print(f"Correlation is: {upper}")
+    print(f"Correlation is:\n {upper}")
     print(f"Correlation above threshold {threshold} for columns {to_drop}")
